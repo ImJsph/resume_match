@@ -8,12 +8,12 @@ import pandas as pd
 import fitz  # PyMuPDF
 # re handles the regex part of filtering for the words that we want to either highlight or ignore
 import re
-# tfidf vectorization is for words and in this case, it would create a vector for a given strings, finding unique words and putting a weight on it based on the frequency
-from sklearn.feature_extraction.text import TfidfVectorizer
-#cosine similarity works in tandem with the vectorizer by comparing 2 vectors and seeing what the match is like there. 
+# cosine similarity works in tandem with the vectorizer/embeddings by comparing 2 vectors and seeing what the match is like there. 
 from sklearn.metrics.pairwise import cosine_similarity
 # os is for the operating system manuevering
 import os
+# sentence-transformers is a Hugging Face library that lets us use BERT-like models to generate embeddings for text
+from sentence_transformers import SentenceTransformer
 
 
 ### APP INITILIZATION + CORS ###
@@ -22,20 +22,7 @@ import os
 # is when running the app, allowing it to correctly have the required resources such as static files. We then call this instance the variable app 
 app = Flask(__name__)
 # cors allows our flask web app initialization to properly communicate with requests that are based on different origins. adds a cors: Access-Control-Allow-Origin: *
-# DEV: allow all origins to avoid localhost vs LAN IP mismatch issues
 CORS(app)
-
-# Optional: cap upload size (protect against giant PDFs)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
-
-# Tiny request logger so you can see if the POST actually arrives
-@app.after_request
-def add_logs(resp):
-    try:
-        print(f"{request.method} {request.path} -> {resp.status_code}")
-    except Exception:
-        pass
-    return resp
 
 
 ### TEXT TOOLS ###
@@ -60,73 +47,49 @@ def extract_resume_text(pdf_path):
 
 ### LOADING DATA ###
 
-# We’ll build an absolute path that works if your CSV is kept in the repo root (one folder up from backend).
-# If you move the CSV into backend/, change the join below to just os.path.join(os.path.dirname(__file__), "postings_clean_shortened.csv")
-postings = pd.DataFrame()
-job_vectors = None
-vectorizer = None
-
 try:
-   # grabs our dataframe that has alrady been cleaned
+    # grabs our dataframe that has already been cleaned
    csv_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "postings_clean_shortened.csv"))
    # read in the csv, __file__: refers to the current Python file. os.path.dirname(__file__): gives the directory where this file lives. os.path.join(...): 
    # safely joins that directory with the CSV filename.
    postings = pd.read_csv(csv_path)
 
-   # identifies the columns of the "object" data type which is strings in pandas
+    # identifies the columns of the "object" data type which is strings in pandas
    str_cols = postings.select_dtypes(include="object").columns
    # gets these string columns and then fills in the empty entries (na) with blank spaces
    postings[str_cols] = postings[str_cols].fillna("")
-
    # creates a new column that is a single line that concatenates the desirable columns
-   # (defensive: only use columns that actually exist in your CSV)
-   base_cols = ["title", "description", "skills_desc", "skill_name", "industry_name"]
-   use_cols = [c for c in base_cols if c in postings.columns]
-   if not use_cols:
-       raise ValueError("No usable text columns found for job_text. Check your CSV column names.")
-
-   postings["job_text"] = postings[use_cols].astype(str).agg(" ".join, axis=1)
+   postings["job_text"] = (
+       postings["title"] + " " +
+       postings["description"] + " " +
+       postings["skills_desc"] + " " +
+       postings["skill_name"] + " " +
+       postings["industry_name"]
+   )
    # normalizes the text through our previously established function
    postings["job_text"] = postings["job_text"].apply(normalize_text).astype(str)
 
-   # the vectorizer function from tfidf uses the stop words to filter the english stop words that have no values in our scenario 
-   # and then the max features = 10000 means that we are limiting to the top 10000 most frequent and important words across all of the documents
-   vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
-   # applies the vectorizer to the postings["job_text"] column
-   job_vectors = vectorizer.fit_transform(postings["job_text"])
+    # ==========================
+    # BERT MODEL FOR EMBEDDINGS
+    # ==========================
+    # Load a pre-trained sentence-transformers model (small, fast, semantically powerful)
+   bert_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-   # sanity check to make sure that the creation of the job description lines and the vectorization was successful
-   print("✅ Job postings loaded and vectorized:", postings.shape)
+    # applies the model to create embeddings for all job postings (done once at startup)
+   job_embeddings = bert_model.encode(postings["job_text"].tolist(), convert_to_numpy=True)
+
+    # sanity check to make sure that the creation of the job description lines and the embeddings was successful
+   print("✅ Job postings loaded and BERT embeddings computed:", postings.shape)
 
 # handles our errors gracefully in the previous chunk of "try"
 # the first line handles that scenario
 except Exception as e:
-   # creates a string message to output
+    # creates a string message to output
    print("❌ Failed to load job postings:", str(e))
-   # sets back the postings and job_vectors to None or empty values so that they do not cause errors or crash when running again
+   # sets back the postings and job_embeddings to None or empty values so that they do not cause errors or crash when running again
    postings = pd.DataFrame()
-   job_vectors = None
-   vectorizer = None
-
-
-### HEALTH / DEBUG ROUTES ###
-
-# Lightweight health route so you can check readiness from the browser
-@app.get("/health")
-def health():
-   ok_vec = job_vectors is not None and getattr(job_vectors, "shape", (0, 0))[0] > 0
-   return jsonify({
-       "status": "ok",
-       "csv_loaded": not postings.empty,
-       "n_rows": int(postings.shape[0]) if not postings.empty else 0,
-       "n_cols": int(postings.shape[1]) if not postings.empty else 0,
-       "vectorized": bool(ok_vec)
-   })
-
-# Simple route to see actual CSV columns (useful if names differ from expectations)
-@app.get("/columns")
-def columns():
-   return jsonify({"columns": list(postings.columns)})
+   job_embeddings = None
+   bert_model = None
 
 
 ### MATCHING ROUTE ###
@@ -138,14 +101,7 @@ def columns():
 # this
 def match_resume():
    try:
-       # early guards provide clearer, user-friendly errors
-       if postings.empty or job_vectors is None or vectorizer is None:
-           return jsonify({"error": "Jobs index not ready. Check /health and the CSV path/columns."}), 500
-
         # gets the uploaded resume file from the POST request
-       if "resume" not in request.files:
-           return jsonify({"error": "No file uploaded. Field name must be 'resume'."}), 400
-
        file = request.files["resume"]
        # saves the uploaded file locally
        file.save("uploaded_resume.pdf")
@@ -157,19 +113,19 @@ def match_resume():
        # prints out the length of our resume text length
        print("📄 Resume text length:", len(resume_text))
 
-       if not resume_text.strip():
-           return jsonify({"error": "Could not extract text from PDF. Try a different resume file."}), 400
-
         # normalizes our resume text
        resume_text = normalize_text(resume_text)
        # ensures the data type that turns the text into string
        resume_text = str(resume_text)
 
-        # applies the vectorizer transformation
-       resume_vector = vectorizer.transform([resume_text])
+        # ==========================
+        # BERT EMBEDDING + SIMILARITY
+        # ==========================
+        # applies the BERT model to encode the resume text
+       resume_embedding = bert_model.encode([resume_text], convert_to_numpy=True)
        # computes the cosine similarity scores between the resume and all the job descriptions and flattens into a 1D vector
-       scores = cosine_similarity(resume_vector, job_vectors).flatten()
-       #creates a new column that grabs the scores for each job description
+       scores = cosine_similarity(resume_embedding, job_embeddings).flatten()
+       # creates a new column that grabs the scores for each job description
        postings["match_score"] = scores
 
         # we get the top matches by score
@@ -181,7 +137,7 @@ def match_resume():
        matched_keywords = set()
        suggested_keywords = set()
 
-        # itereates through the top 5 job descriptions
+        # iterates through the top 5 job descriptions
        for _, row in top_matches.iterrows():
            # creates a new job_text through concatenation
            job_text = " ".join([
@@ -200,17 +156,11 @@ def match_resume():
         # sanity check 
        print("✅ Matching complete.")
 
-       # be defensive: only return columns that exist in your CSV
-       ret_cols = [c for c in ["title", "company_name", "location", "job_posting_url", "match_score"] if c in top_matches.columns]
-
         # returns the jsonified response for the top 5 job descriptions, all matched keywords, and the top 10 suggested keywords
-       # (small quality tweak: trim suggestions to those not already matched and prefer longer terms first)
-       clean_suggestions = sorted((suggested_keywords - matched_keywords), key=len, reverse=True)[:15]
-
        return jsonify({
-           "matches": top_matches[ret_cols].to_dict(orient="records"),
+           "matches": top_matches[["title", "company_name", "location", "job_posting_url", "match_score"]].to_dict(orient="records"),
            "matched_keywords": sorted(matched_keywords),
-           "suggested_keywords": clean_suggestions
+           "suggested_keywords": sorted(suggested_keywords)[:10]
        })
 
     # error handler matches a server side error and will return the error that we are dealing with in terms of the code chunk before
@@ -220,5 +170,4 @@ def match_resume():
 
 # starts running the flask app if this file is run directly
 if __name__ == "__main__":
-   # explicitly bind for clarity in dev; 0.0.0.0 lets localhost and LAN both work
    app.run(debug=True, host="0.0.0.0", port=5001)
