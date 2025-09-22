@@ -1,0 +1,29 @@
+# Python / Flask
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+.env
+.venv/
+env/
+venv/
+
+# Uploaded/data
+backend/uploaded_resume.pdf
+backend/postings_clean_shortened.csv
+
+# React / Node
+frontend/node_modules/
+frontend/build/
+frontend/.env
+
+# OS/Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Archives / backups
+*.zip
