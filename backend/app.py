@@ -92,13 +92,11 @@ except Exception as e:
    bert_model = None
 
 
-### MATCHING ROUTE ###
+### MATCHING ROUTES ###
 
 # registers a route with Flask that listens for POST requests at /match
 # this is typically used to handle file uploads or data sent from the frontend to the backend
 @app.route("/match", methods=["POST"])
-
-# this
 def match_resume():
    try:
         # gets the uploaded resume file from the POST request
@@ -146,10 +144,7 @@ def match_resume():
                str(row.get("skill_name", ""))
            ]).lower()
            # tokenizes job_text into words 
-           # r denotes a raw string, b is for the word anchor boundary so that whole words are matched, \w is for all word characters
-           # and the + is for the one or more character groups 
            job_words = set(re.findall(r'\b\w+\b', job_text))
-           # finds common keywords between the resume and the job with the "&" being used for a set intersection allowing us to find the sets
            matched_keywords.update(resume_words & job_words)
            suggested_keywords.update(job_words - resume_words)
 
@@ -159,14 +154,61 @@ def match_resume():
         # returns the jsonified response for the top 5 job descriptions, all matched keywords, and the top 10 suggested keywords
        return jsonify({
            "matches": top_matches[["title", "company_name", "location", "job_posting_url", "match_score"]].to_dict(orient="records"),
-           "matched_keywords": sorted(matched_keywords),
+           "matched_keywords": sorted(matched_keywords)[:10],
            "suggested_keywords": sorted(suggested_keywords)[:10]
        })
 
-    # error handler matches a server side error and will return the error that we are dealing with in terms of the code chunk before
    except Exception as e:
        print("❌ Error in /match:", str(e))
        return jsonify({"error": str(e)}), 500
+
+
+# ==========================
+# CUSTOM JOB DESCRIPTION MATCH
+# ==========================
+# this route allows the user to paste their own job description text instead of relying on the Kaggle dataset
+@app.route("/match_custom", methods=["POST"])
+def match_custom():
+    try:
+        # get resume from uploaded file
+        file = request.files["resume"]
+        file.save("uploaded_resume.pdf")
+        resume_text = extract_resume_text("uploaded_resume.pdf")
+        resume_text = normalize_text(resume_text)
+
+        # get custom job description text from the request (sent as form-data)
+        job_text = request.form.get("job_description", "")
+        job_text = normalize_text(job_text)
+
+        if not resume_text or not job_text:
+            return jsonify({"error": "Missing resume or job description"}), 400
+
+        # encode both resume and job description with BERT
+        resume_embedding = bert_model.encode([resume_text], convert_to_numpy=True)
+        job_embedding = bert_model.encode([job_text], convert_to_numpy=True)
+
+        # compute similarity score
+        score = float(cosine_similarity(resume_embedding, job_embedding)[0][0])
+
+        # extract matched and suggested keywords
+        resume_words = set(re.findall(r'\b\w+\b', resume_text))
+        job_words = set(re.findall(r'\b\w+\b', job_text))
+        matched_keywords = sorted(resume_words & job_words)
+        suggested_keywords = sorted(job_words - resume_words)
+
+        print("✅ Custom job description matching complete.")
+
+        return jsonify({
+            "job_description": job_text,
+            "match_score": score,
+            "matched_keywords": matched_keywords[:10],
+            "suggested_keywords": suggested_keywords[:10]
+        })
+
+    except Exception as e:
+        print("❌ Error in /match_custom:", str(e))
+        return jsonify({"error": str(e)}), 500
+
 
 # starts running the flask app if this file is run directly
 if __name__ == "__main__":
